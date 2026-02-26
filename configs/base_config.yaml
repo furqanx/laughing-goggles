@@ -10,21 +10,21 @@ experiment:
 
 # --- 2. DATASET ---
 data:
-  train_path      : "data/interim/train"  
-  val_path        : "data/interim/val"    
-  background_path : "data/background"
+  train_path      : "/content/drive/MyDrive/LAB-AI/dataset_kws_processed/train"  
+  val_path        : "/content/drive/MyDrive/LAB-AI/dataset_kws_processed/valid"    
+  background_path : "/content/drive/MyDrive/LAB-AI/_background_noise_"
   extension       : "wav"                  
   sample_rate     : 16000                 
   # Dataloader Settings
-  batch_size      : 32
-  num_workers     : 2       
+  batch_size      : 16
+  num_workers     : 0       
   max_duration    : 3.0
   # SAMPLER CONFIG
   sampler         : "random"   # PENTING: ArcFace lebih suka Random daripada Balanced
   # samples_per_class: 4       # (Tidak dipakai jika sampler='random')
   
   # Isi ini sesuai jumlah folder speaker 
-  n_classes       : 32         # Hanya Class Train saja.
+  n_classes       : 35         # Hanya Class Train saja.
 
 # --- 3. MODEL ARCHITECTURE ---
 model:
@@ -48,7 +48,7 @@ loss:
 
 # --- 5. TRAINING HYPERPARAMETERS ---
 train:
-  epochs       : 20
+  epochs       : 30
   learning_rate: 0.001
   optimizer    : "adam"    
   device       : "cuda"
