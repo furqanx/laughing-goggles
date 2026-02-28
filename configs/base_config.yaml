@@ -35,7 +35,11 @@ data:
 
 # --- 3. MODEL ARCHITECTURE (Pure CTC Core) ---
 model:
-  backbone                 : "microsoft/wavlm-base-plus"
+  backbone                 : "microsoft/wavlm-base-plus"       # Ringan, cocok untuk eksperimen awal
+  # backbone               : "microsoft/wavlm-large"           # Akurasi tinggi, butuh VRAM besar
+  # backbone               : "facebook/wav2vec2-large-xlsr-53" # Sangat bagus untuk fonem IPA
+  # backbone               : "facebook/hubert-large-ls960-ft"  # Sangat stabil
+
   freeze_feature_extractor : True    
   
   mask_time_prob           : 0.05
