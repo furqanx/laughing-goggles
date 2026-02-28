@@ -1,374 +1,185 @@
 import os
-from glob import glob
-import numpy as np
-
-try:
-    from spafe.features.cqcc import cqcc
-    from spafe.features.gfcc import gfcc
-except ImportError:
-    print("[Warning] spafe not installed. Feature extraction might fail")
-
+import random
 import torch
-from torch.utils.data import Dataset, DataLoader
-import tensorflow as tf
+import torchaudio
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, Sampler
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
 
-from .preprocessing import (
-    load_audio, 
-    reduce_noise, 
-    normalize_audio, 
-    silence_trimming, 
-    segment_audio,
-    load_noise_files,
-    add_background_noise
-)
+from src.preprocessing import DynamicNoiseInjector
 
-from .utils.sampler import (
-    BalancedBatchScheduler, 
-    TorchBalancedSampler
-)
+# ==========================================
+# 1. DATA COLLATOR
+# ==========================================
+@dataclass
+class DataCollatorCTCWithPadding:
+    processor: Any
+    padding: Union[bool, str] = True
 
-class AudioTFDataset:
-    def __init__(self, file_paths, labels, feature_extractors=['gfcc']):
-        self.file_paths = file_paths
-        self.labels = labels
-        self.feature_extractors = feature_extractors
-        self.sample_rate = 16000
-        self.target_duration = 3
-        
-    def __processing__(self, file_path_tensor, label_tensor):
-        """
-        Ini adalah logika Python murni (mirip __getitem__ di PyTorch).
-        Fungsi ini akan dijalankan di CPU.
-        """
-        # 1. Decode byte string dari Tensor ke string path biasa
-        file_name = file_path_tensor.numpy().decode('utf-8')
-        label = label_tensor.numpy()
-        
-        # 1. Load data
-        waveform = load_audio(file_name, backend='tf') # Return numpy array/list
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # Pisahkan input_values (audio) dan labels (teks fonem)
+        input_features = [{"input_values": feature["input_values"]} for feature in features]
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
 
-        # 2. Noise reduction
-        waveform = reduce_noise(waveform, backend='tf', sample_rate=self.sample_rate)
-        
-        # 3. Normalisasi
-        waveform = normalize_audio(waveform, backend='tf')
-        
-        # 4. Smart trimming
-        waveform = silence_trimming(waveform, backend='tf', top_db=20)
-
-        # 5. Segmentasi
-        target_length = int(self.target_duration * self.sample_rate)
-        waveform = segment_audio(waveform, backend='tf', target_length=target_length)
-        
-        # Pastikan format numpy float32
-        waveform_np = np.array(waveform).astype(np.float32)
-        # Reshape (N, 1)
-        waveform_reshaped = waveform_np[:, np.newaxis]
-
-
-        ############################
-        # --- FEATURE EXTRACTION ---
-        ############################
-        # Kita harus return array fix, bukan dict dinamis agar mudah ditangkap TF
-        # Misal kita asumsikan output GFCC shape-nya (Time, Freq, 1)
-        gfcc_feat = np.zeros((1, 1), dtype=np.float32) # Placeholder
-        cqcc_feat = np.zeros((1, 1), dtype=np.float32) # Placeholder
-        
-        # Logika ekstraksi
-        if 'gfcc' in self.feature_extractors:
-            gfcc_feat = gfcc(sig=waveform_reshaped).astype(np.float32)
-        
-        if 'cqcc' in self.feature_extractors:
-            cqcc_feat = cqcc(sig=waveform_reshaped).astype(np.float32)
-
-        return gfcc_feat, cqcc_feat, label
-
-
-    def get_dataset(self):
-        """
-        Membangun tf.data.Dataset
-        """
-        # 1. Buat dataset dasar dari path dan label
-        dataset = tf.data.Dataset.from_tensor_slices((self.file_paths, self.labels))
-
-        # 2. Bungkus fungsi python kita dengan tf.py_function
-        def tf_wrapper(file_path, label):
-            # tf.py_function(func, inputs, output_types)
-            gfcc_out, cqcc_out, label_out = tf.py_function(
-                func=self.__processing__,
-
-                inp=[file_path, label],
-                
-                # Tentukan tipe data outputnya
-                Tout=[tf.float32, tf.float32, tf.int64]
-            )
-            
-            # PENTING: Set shape output (tf.py_function menghilangkan info shape)
-            # Sesuaikan shape ini dengan output ekstraktor fitur Anda
-            # Contoh: (Time, Feature_Dim)
-            gfcc_out.set_shape([None, None]) 
-            cqcc_out.set_shape([None, None])
-            label_out.set_shape([]) # Scalar
-            
-            # Kembalikan dictionary agar rapi seperti PyTorch code Anda
-            features = {}
-            if 'gfcc' in self.feature_extractors:
-                features['gfcc'] = gfcc_out
-            if 'cqcc' in self.feature_extractors:
-                features['cqcc'] = cqcc_out
-                
-            return features, label_out
-
-        # 3. Map wrapper ke dataset
-        # num_parallel_calls=tf.data.AUTOTUNE agar proses load berjalan paralel (multiprocessing)
-        dataset = dataset.map(tf_wrapper, num_parallel_calls=tf.data.AUTOTUNE)
-        
-        return dataset
-
-
-    def get_dml_dataset(self, n_classes=4, n_samples=2):
-        """
-        Versi Dataset KHUSUS untuk Deep Metric Learning
-        """
-        # 1. Inisialisasi Scheduler
-        scheduler = BalancedBatchScheduler(self.labels, n_classes, n_samples)
-        
-        # 2. Buat Generator Python
-        def generator():
-            # Scheduler menghasilkan list index per batch
-            for batch_indices in scheduler: 
-                for idx in batch_indices:
-                    # Yield data satu per satu sesuai urutan scheduler
-                    yield self.file_paths[idx], self.labels[idx]
-
-        # 3. Buat Dataset dari Generator
-        dataset = tf.data.Dataset.from_generator(
-            generator,
-            output_signature=(
-                tf.TensorSpec(shape=(), dtype=tf.string),
-                tf.TensorSpec(shape=(), dtype=tf.int64)
-            )
+        # Padding Audio menggunakan Feature Extractor
+        batch = self.processor.pad(
+            input_features,
+            padding=self.padding,
+            return_tensors="pt",
         )
 
-        # 4. Map Processing (Sama seperti sebelumnya)
-        # Gunakan wrapper self.__processing__ yang sudah ada
-        def tf_wrapper(file_path, label):
-            # tf.py_function(func, inputs, output_types)
-            gfcc_out, cqcc_out, label_out = tf.py_function(
-                func=self.__processing__,
+        # REVISI 2: Padding Label (Token ID) secara eksplisit menggunakan Tokenizer
+        labels_batch = self.processor.tokenizer.pad(
+            label_features,
+            padding=self.padding,
+            return_tensors="pt",
+        )
 
-                inp=[file_path, label],
-                
-                # Tentukan tipe data outputnya
-                Tout=[tf.float32, tf.float32, tf.int64]
-            )
-            
-            # PENTING: Set shape output (tf.py_function menghilangkan info shape)
-            # Sesuaikan shape ini dengan output ekstraktor fitur Anda
-            # Contoh: (Time, Feature_Dim)
-            gfcc_out.set_shape([None, None]) 
-            cqcc_out.set_shape([None, None])
-            label_out.set_shape([]) # Scalar
-            
-            # Kembalikan dictionary agar rapi seperti PyTorch code Anda
-            features = {}
-            if 'gfcc' in self.feature_extractors:
-                features['gfcc'] = gfcc_out
-            if 'cqcc' in self.feature_extractors:
-                features['cqcc'] = cqcc_out
-                
-            return features, label_out
+        labels = labels_batch["input_ids"]
+        # Ganti padding token di labels menjadi -100 agar diabaikan oleh PyTorch Loss (CTC)
+        labels = labels.masked_fill(labels == self.processor.tokenizer.pad_token_id, -100)
 
-        dataset = dataset.map(tf_wrapper, num_parallel_calls=tf.data.AUTOTUNE)
+        batch["labels"] = labels
+        return batch
+
+# ==========================================
+# 2. BUCKET BATCH SAMPLER
+# ==========================================
+class BucketBatchSampler(Sampler):
+    def __init__(self, dataset, batch_size):
+        self.dataset = dataset
+        self.batch_size = batch_size
         
-        # 5. Batching
-        # PENTING: Batch size harus pas P*K. 
-        # Karena generator sudah mengurutkan P*K, batching disini tinggal "memotong" stream.
-        dataset = dataset.batch(n_classes * n_samples)
+        # Cari tahu nama kolom durasi yang benar (antisipasi perbedaan penamaan)
+        df_cols = dataset.data.columns
+        self.dur_col = 'audio_duration_sec' if 'audio_duration_sec' in df_cols else 'duration'
+
+        self.ind_n_len = []
+        for i in range(len(dataset)):
+            self.ind_n_len.append((i, dataset.data.iloc[i].get(self.dur_col, 0)))
         
-        return dataset
-
-class AudioPTDataset(Dataset):
-    def __init__(self, 
-            file_paths, labels, 
-            preprocess=True, target_duration=3.0, sample_rate=16_000, 
-            feature_extractors=[], 
-            background_noise=False, 
-            noise_path=None
-        ):
-        self.file_paths = file_paths
-        self.labels = labels
-        self.preprocess_enabled = preprocess
-        self.feature_extractors = feature_extractors
-        self.sample_rate = sample_rate
-        self.target_duration = target_duration
-        self.background_noise = background_noise
-
-        self.noise_dict = {}
-        if self.background_noise and noise_path:
-            # Load noise sekali saja saat inisialisasi dataset
-            # Agar RAM efisien dan tidak baca harddisk terus menerus
-            print("[Dataset] Loading background noise files...")
-            self.noise_dict = load_noise_files(noise_path, sample_rate=self.sample_rate)
+        # Urutkan berdasarkan durasi (terpendek ke terpanjang)
+        self.ind_n_len.sort(key=lambda x: x[1])
+        self.batches = [self.ind_n_len[i:i + batch_size] for i in range(0, len(self.ind_n_len), batch_size)]
+        
+    def __iter__(self):
+        random.shuffle(self.batches)
+        for batch in self.batches:
+            yield [idx for idx, _ in batch]
             
-            if not self.noise_dict:
-                print("[Warning] Background noise diaktifkan tapi folder kosong/tidak ditemukan. Augmentasi akan dilewati.")
+    def __len__(self):
+        return len(self.batches)
+
+# ==========================================
+# 3. DATASET KUSTOM
+# ==========================================
+class ASRDataset(Dataset):
+    def __init__(self, data, processor, target_sr=16000, augmentor=None, target_col='phonetic_text'):
+        self.data = data
+        self.processor = processor
+        self.target_sr = target_sr 
+        self.augmentor = augmentor
+        self.target_col = target_col 
 
     def __len__(self):
-        return len(self.file_paths)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        # Dapatkan info file dan label
-        file_name = self.file_paths[idx]
-        label = self.labels[idx]
+        row = self.data.iloc[idx]
+        
+        audio_path = row['audio_path']
+        transcript = row[self.target_col] 
 
-        # 1. Load data
-        waveform = load_audio(file_name, backend='pt', target_sr=self.sample_rate)
-
-        # if self.preprocess_enabled:
-        #     # 2. Preprocessing: hilangkan silent
-        #     waveform = silence_trimming(waveform, backend='pt', top_db=20)
-        #     # 3. Noise reduction 
-        #     waveform = reduce_noise(waveform, backend='pt', sample_rate=self.sample_rate)
-
-        if self.background_noise and self.noise_dict:
-            # A. Konversi Tensor ke Numpy (karena fungsi add_background_noise pakai numpy)
-            wav_numpy = waveform.numpy()
-            # Jika dimensi (1, N), ubah jadi (N,) untuk pemrosesan numpy
-            if wav_numpy.ndim > 1:
-                wav_numpy = wav_numpy.squeeze()
-                
-            # B. Tambahkan Noise
-            # noise_reduction bisa di-randomize juga kalau mau variatif
-            wav_noisy = add_background_noise(wav_numpy, self.noise_dict, noise_reduction=0.5)
+        waveform, sample_rate = torchaudio.load(audio_path)
+        
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # C. Kembalikan ke Tensor PyTorch
-            waveform = torch.from_numpy(wav_noisy)
-            
-            # Kembalikan dimensi channel jika hilang (jadi [1, N])
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
+        if sample_rate != self.target_sr:
+            # REVISI 3: Gunakan fungsi fungsional agar tidak memberatkan CPU di setiap iterasi
+            waveform = torchaudio.functional.resample(waveform, orig_freq=sample_rate, new_freq=self.target_sr)
 
-        if self.preprocess_enabled:
-            # 4. Normalisasi amplitudo ke [-1,1]
-            waveform = normalize_audio(waveform, backend='pt')
+        waveform = waveform.squeeze(0).numpy()
 
-        # 5. Standarisasi durasi (proses Segmentasi)
-        target_length = int(self.target_duration * self.sample_rate)
-        waveform = segment_audio(waveform, backend='pt', target_length=target_length)
+        if self.augmentor is not None:
+            waveform = self.augmentor(waveform_np=waveform, sample_rate=self.target_sr)
 
-        # KASUS A: RAW AUDIO (Jika feature_extractors kosong)
-        # Digunakan untuk: RawNet, ResNetSE, ECAPA-TDNN
-        if not self.feature_extractors or len(self.feature_extractors) == 0:
-            if waveform.dim() > 1:
-                waveform = waveform.squeeze()
-            return waveform, torch.tensor(label).long()
-        # KASUS B: FEATURE EXTRACTION (Jika feature_extractors ada isinya)
-        # Digunakan untuk: Model klasik / Eksperimen fitur manual
-        else:
-            # Konversi pytorch ke numpy
-            waveform_np = waveform.numpy()
-            # Spafe butuh input (N, 1) atau (N,) tergantung versi, amannya kita reshape
-            if waveform_np.ndim == 1:
-                waveform_reshaped = waveform_np[:, np.newaxis]
-            else:
-                waveform_reshaped = waveform_np
+        input_values = self.processor(waveform, sampling_rate=self.target_sr).input_values[0]
+        
+        # REVISI 1: Gunakan pemanggilan tokenizer modern (as_target_processor sudah deprecated)
+        labels = self.processor.tokenizer(transcript).input_ids
 
-            # 6. Ekstraksi fitur
-            features = {}
+        return {
+            "input_values": input_values,
+            "labels": labels
+        }
 
-            # Ekstraksi GFCC
-            if 'gfcc' in self.feature_extractors:
-                # Konversi hasil numpy ke Tensor PyTorch
-                feat = gfcc(sig=waveform_reshaped, fs=self.sample_rate)
-                features['gfcc'] = torch.from_numpy(feat).float()
-                
-            # Ekstraksi CQCC
-            if 'cqcc' in self.feature_extractors:
-                feat = cqcc(sig=waveform_reshaped, fs=self.sample_rate)
-                features['cqcc'] = torch.from_numpy(feat).float()
-
-        return features, torch.tensor(label).long()
+def filter_data(df, min_duration=0.5, max_duration=15.0):
+    # REVISI 4: Pengecekan kolom durasi dinamis
+    dur_col = 'audio_duration_sec' if 'audio_duration_sec' in df.columns else 'duration'
     
-def create_dataset_from_path(data_path, config, augment=False):
-    """
-    Helper function untuk membuat instance Dataset dari path folder.
-    Param 'augment' menentukan apakah noise injection diaktifkan atau tidak.
-    """
-    files = glob(os.path.join(data_path, '**', '*.wav'), recursive=True)
-    if not files:
-        return None
+    if dur_col in df.columns:
+        return df[(df[dur_col] >= min_duration) & (df[dur_col] <= max_duration)].reset_index(drop=True)
+    return df
 
-    # Labeling berdasarkan nama folder parent
-    classes = sorted(list(set([os.path.basename(os.path.dirname(f)) for f in files])))
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    labels = [class_to_idx[os.path.basename(os.path.dirname(f))] for f in files]
+# ==========================================
+# 4. GET DATALOADER
+# ==========================================
+def get_dataloader(config, processor):
+    print(f"[DataLoader] Membaca manifest: {config['train_manifest']}")
     
-    feats_to_use = config.get('features', [])
+    train_df = pd.read_json(config['train_manifest'], lines=True)
+    val_df = pd.read_json(config['val_manifest'], lines=True)
     
-    # Ambil path noise dari config
-    noise_folder = config.get('background_path', None)
-    
-    # Logika Augmentasi:
-    # Hanya aktifkan jika parameter augment=True DAN folder noise ada di config
-    apply_noise = augment and (noise_folder is not None)
+    min_dur = config.get('min_duration', 0.5)
+    max_dur = config.get('max_duration', 15.0)
+    target_col = config.get('target_column', 'text') 
 
-    ds = AudioPTDataset(
-        file_paths=files, 
-        labels=labels, 
-        preprocess=True,
-        feature_extractors=feats_to_use,
-        target_duration=config.get('max_duration', 3.0),
-        sample_rate=config.get('sample_rate', 16000),
-        # --- Parameter Augmentasi ---
-        background_noise=apply_noise,  # True hanya untuk train
-        noise_path=noise_folder        # Path ke folder noise
+    print(f"[DataLoader] Filter durasi: {min_dur}s - {max_dur}s")
+    train_df = filter_data(train_df, min_duration=min_dur, max_duration=max_dur)
+    val_df = filter_data(val_df, min_duration=min_dur, max_duration=20.0)
+    print(f"[DataLoader] Sisa data setelah difilter -> Train: {len(train_df)}, Val: {len(val_df)}")
+
+    target_sr = config.get('sample_rate', 16000)
+    
+    noise_dir = config.get('noise_dir', './data/raw/noise')
+    noise_injector = None
+    if os.path.exists(noise_dir):
+        noise_prob = config.get('noise_prob', 0.5) 
+        noise_injector = DynamicNoiseInjector(noise_dir=noise_dir, p=noise_prob)
+        print(f"[DataLoader] Augmentasi Noise diaktifkan (Prob: {noise_prob}) dari {noise_dir}")
+    else:
+        print(f"[DataLoader] ⚠️ Peringatan: Folder noise '{noise_dir}' tidak ditemukan. Augmentasi dinonaktifkan.")
+
+    train_ds = ASRDataset(
+        data=train_df, processor=processor, target_sr=target_sr, 
+        augmentor=noise_injector, target_col=target_col
+    )
+    val_ds = ASRDataset(
+        data=val_df, processor=processor, target_sr=target_sr, 
+        augmentor=None, target_col=target_col
     )
 
-    return ds
-
-def get_dataloader(config):
-    batch_size = config['batch_size']
-    num_workers = config.get('num_workers', 2)
-
-    # --- 1. SETUP TRAIN LOADER ---
-    train_ds = create_dataset_from_path(
-        config['train_path'], 
-        config,
-        augment=True
-    )
-    if train_ds is None:
-        raise RuntimeError(f"No audio files found in train path: {config['train_path']}")
+    data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
+    train_sampler = BucketBatchSampler(train_ds, batch_size=config['batch_size'])
 
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=batch_size, 
-        shuffle=True,           # Shuffle untuk Training
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True
+        train_ds,
+        batch_sampler=train_sampler,
+        num_workers=config.get('num_workers', 4), 
+        collate_fn=data_collator, 
+        pin_memory=True
     )
-
-    # --- 2. SETUP VAL LOADER ---
-    val_loader = None
-    if config.get('val_path'):
-        val_ds = create_dataset_from_path(
-            config['val_path'], 
-            config,
-            augment=False
-        )
-        
-        if val_ds is not None:
-            val_loader = DataLoader(
-                val_ds, 
-                batch_size=batch_size, 
-                shuffle=False,      # Jangan shuffle Validasi
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=False     # Jangan buang sisa data validasi
-            )
-            print(f"[DataLoader] Validation Loader created with {len(val_ds)} samples.")
-        else:
-            print(f"[DataLoader] Warning: val_path provided but no files found.")
-
+    
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config.get('num_workers', 4),
+        collate_fn=data_collator,
+        pin_memory=True
+    )
+    
     return train_loader, val_loader

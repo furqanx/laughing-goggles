@@ -4,5 +4,22 @@ setup.cfg
 # both this is for local only
 logs/
 data/
+notebooks/
+# models/ 
+
+# Abaikan folder data & output
+__pycache__/
+*.pyc
+
+LICENSE
+setup.cfg
+
+# Abaikan file konfigurasi sistem/env
+.DS_Store
+.ipynb_checkpoints/
+
+# both this is for local only
+logs/
+data/
 # models/ 
 debug.py

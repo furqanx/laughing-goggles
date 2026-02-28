@@ -1,54 +1,63 @@
 # ==========================================
-# BASE CONFIGURATION FOR AUDIO RESEARCH
+# PURE CTC ASR CONFIGURATION (Raw Audio -> WavLM -> CTC)
 # ==========================================
 
 # --- 1. EXPERIMENT INFO ---
 experiment:
-  project_name : "My_First_Audio_Model"
+  project_name : "wavlm-ctc-asr-v1" 
   seed         : 42              
-  output_dir   : "./experiments" 
+  output_dir   : "./logs/experiments"
+  use_wandb    : True
 
-# --- 2. DATASET ---
+# --- 2. DATA PIPELINE ---
 data:
-  train_path      : "/content/drive/MyDrive/LAB-AI/dataset_kws_processed/train"  
-  val_path        : "/content/drive/MyDrive/LAB-AI/dataset_kws_processed/valid"    
-  background_path : "/content/drive/MyDrive/LAB-AI/_background_noise_"
-  extension       : "wav"                  
-  sample_rate     : 16000                 
-  # Dataloader Settings
-  batch_size      : 16
-  num_workers     : 0       
-  max_duration    : 3.0
-  # SAMPLER CONFIG
-  sampler         : "random"   # PENTING: ArcFace lebih suka Random daripada Balanced
-  # samples_per_class: 4       # (Tidak dipakai jika sampler='random')
+  # Path disesuaikan dengan skrip offline preprocessing kita
+  # Ubah ke /content/... jika Anda menjalankannya di Colab
+  train_manifest  : "./data/processed/train_phon_transcripts.jsonl"
+  val_manifest    : "./data/processed/val_phon_transcripts.jsonl"
   
-  # Isi ini sesuai jumlah folder speaker 
-  n_classes       : 35         # Hanya Class Train saja.
+  # [WAJIB] Path ke kamus 52 karakter kompetisi
+  vocab_path      : "./data/processed/vocab.json"
+  
+  # [WAJIB] Nama kolom transkrip di dalam file JSONL
+  target_column   : "phonetic_text"
 
-# --- 3. MODEL ARCHITECTURE ---
+  noise_dir       : "./data/raw/noise"
+  noise_prob      : 0.5
+  
+  sample_rate     : 16000
+  
+  # Batch Size diturunkan ke 8 agar aman dari OOM
+  batch_size      : 8
+  num_workers     : 4 
+  min_duration    : 0.5
+  max_duration    : 15.0
+
+# --- 3. MODEL ARCHITECTURE (Pure CTC Core) ---
 model:
-  backend         : "pytorch"   
-  name            : "resnetse34l"  
-  embedding_dim   : 256   
-  encoder_type    : "ASP"  
+  backbone                 : "microsoft/wavlm-base-plus"
+  freeze_feature_extractor : True    
+  
+  mask_time_prob           : 0.05
+  mask_time_length         : 10
+  mask_feature_prob        : 0.05
+  mask_feature_length      : 10
 
-# --- 4. LOSS FUNCTION ---
-loss:
-  name: "arcface"
-  margin: 28.6     
-  scale: 64.0      
-# loss:
-#   name: "cosface" # atau triplet
-#   margin: 0.2     # Kalau ini pakai angka desimal biasa
-#   scale: 30.0
-# loss:
-#   name         : "triplet"      # Pilihan: 'triplet', 'arcface', 'contrastive'
-#   margin       : 0.2          # Jarak minimal pemisah antar kelas
-
-# --- 5. TRAINING HYPERPARAMETERS ---
+# --- 4. TRAINING HYPERPARAMETERS ---
 train:
-  epochs       : 30
-  learning_rate: 0.001
-  optimizer    : "adam"    
+  epochs       : 20
+  learning_rate: 1e-4     
+  optimizer    : "adamw"  
+  weight_decay : 0.005    
+  use_8bit_adam: False # Set True jika library bitsandbytes sudah terinstall
+  
+  # [WAJIB] Karena model kita Murni CTC, bobotnya harus 100% (1.0)
+  ctc_weight   : 1.0
+
+  fp16: True
+  
+  # Real Batch Size = batch_size (8) * accum_steps (4) = 32
+  gradient_accumulation_steps: 4
+  
   device       : "cuda"
+  logging_steps : 100
